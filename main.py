@@ -1,28 +1,28 @@
 """
-Face Detection & Tracking — SORT-Style Kalman Tracker
+People Detection & Tracking — SORT-Style Kalman Tracker
 ======================================================
 WHY THIS IS DIFFERENT:
 
 Every previous version used simple centroid distance + EMA smoothing.
-That breaks when faces move fast, rotate, or skip between detection frames.
+That breaks when people move fast, rotate, or skip between detection frames.
 
 This version uses a Kalman Filter tracker (the same algorithm used in
 SORT — Simple Online and Realtime Tracking, the industry standard).
 
-Each tracked face has a Kalman state: [cx, cy, w, h, vx, vy, vw, vh]
-  • Predicts WHERE the face will be next frame (velocity-aware)
+Each tracked person has a Kalman state: [cx, cy, w, h, vx, vy, vw, vh]
+  • Predicts WHERE the person will be next frame (velocity-aware)
   • Boxes stay locked on during fast head turns and movement
   • Between detection frames, Kalman prediction keeps boxes smooth
   • Matching uses predicted positions, not stale last-seen positions
-  • Handles faces teleporting across screen between detections
+  • Handles people teleporting across screen between detections
 
-Detection: SSD + YuNet (fast, on downscaled frames)
-Optional:  RetinaFace in background thread for bonus accuracy
+Detection: MobileNet-SSD person detector (fast, on downscaled frames)
+Optional:  YOLOv8n verification for stronger precision
 Auditor:   Background thread cleans false positives & merges duplicates
 
 Requirements:
     pip install opencv-python numpy           # minimum (Pi 5 + Mac)
-    pip install retina-face                    # optional (best accuracy)
+
 """
 
 import cv2
@@ -57,13 +57,14 @@ INACTIVE_TIMEOUT = 1.5      # seconds before marking inactive for photo logic
 DEDUP_IOU = 0.5
 
 # Detector thresholds
-DNN_CONF = 0.52
-YUNET_CONF = 0.65
-RETINA_CONF = 0.80
-MIN_FACE_PX = 30            # on detect-resolution frame
+FAST_PERSON_CONF = 0.62
+STRONG_PERSON_CONF = 0.70
+MIN_PERSON_PX = 48          # on detect-resolution frame
+MIN_PERSON_ASPECT = 0.22    # width / height
+MAX_PERSON_ASPECT = 0.95
 
 # Auditor
-AUDIT_INTERVAL = 30
+AUDIT_INTERVAL = 15
 AUDIT_HIST_CORREL = 0.80
 
 # Paths
@@ -72,9 +73,9 @@ FACES_DIR = "faces"
 MODEL_DIR = "models"
 DEADZONE = 40
 
-PROTOTXT_URL = "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/deploy.prototxt"
-CAFFE_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
-YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+PERSON_PROTO_URL = "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/deploy.prototxt"
+PERSON_CAFFE_URL = "https://github.com/chuanqi305/MobileNet-SSD/raw/master/mobilenet_iter_73000.caffemodel"
+YOLO_PERSON_URL = "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.onnx"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -458,135 +459,89 @@ class Cam:
 # DETECTORS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class SSD:
+def _valid_person_box(x1, y1, x2, y2):
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw < MIN_PERSON_PX or bh < MIN_PERSON_PX:
+        return False
+    asp = bw / max(bh, 1e-6)
+    return MIN_PERSON_ASPECT <= asp <= MAX_PERSON_ASPECT
+
+
+class MobileNetSSDPerson:
     def __init__(self, proto, model):
         self.net = cv2.dnn.readNetFromCaffe(proto, model)
-        print("[INIT] SSD ResNet-10 ✓")
+        self.person_class_id = 15
+        print("[INIT] MobileNet-SSD (person) ✓")
 
     def detect(self, frame):
         h, w = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
+        blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
         self.net.setInput(blob)
         out = self.net.forward()
         boxes = []
         for i in range(out.shape[2]):
-            c = out[0, 0, i, 2]
-            if c < DNN_CONF:
+            klass = int(out[0, 0, i, 1])
+            conf = float(out[0, 0, i, 2])
+            if klass != self.person_class_id or conf < FAST_PERSON_CONF:
                 continue
             b = (out[0, 0, i, 3:7] * [w, h, w, h]).astype(int)
             x1, y1, x2, y2 = clamp(b[0], b[1], b[2], b[3], w, h)
-            if x2 - x1 >= MIN_FACE_PX and y2 - y1 >= MIN_FACE_PX:
+            if _valid_person_box(x1, y1, x2, y2):
                 boxes.append((x1, y1, x2, y2))
         return boxes
 
 
-class YuNetDet:
-    def __init__(self, path):
-        self.d = cv2.FaceDetectorYN.create(
-            path, "", (320, 320), YUNET_CONF, 0.3, 5000)
-        print("[INIT] YuNet ✓")
+class YOLOPerson:
+    def __init__(self, model_path, conf=STRONG_PERSON_CONF):
+        self.net = cv2.dnn.readNetFromONNX(model_path)
+        self.conf = conf
+        self.inp = 640
+        print("[INIT] YOLOv8n (person) ✓")
 
     def detect(self, frame):
         h, w = frame.shape[:2]
-        self.d.setInputSize((w, h))
-        _, faces = self.d.detect(frame)
-        boxes = []
-        if faces is not None:
-            for f in faces:
-                x1, y1 = int(f[0]), int(f[1])
-                x2, y2 = x1 + int(f[2]), y1 + int(f[3])
-                x1, y1, x2, y2 = clamp(x1, y1, x2, y2, w, h)
-                if x2 - x1 >= MIN_FACE_PX and y2 - y1 >= MIN_FACE_PX:
-                    boxes.append((x1, y1, x2, y2))
-        return boxes
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# RETINAFACE BACKGROUND THREAD
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RetinaThread:
-    def __init__(self):
-        from retinaface import RetinaFace as RF
-        self.RF = RF
-        self.lock = threading.Lock()
-        self.input_frame = None
-        self.result_boxes = []
-        self.new_input = False
-        self.on = True
-        self.ready = False
-        print("[INIT] RetinaFace loading...")
-        tmp = "/tmp/_rf_warm.jpg"
-        cv2.imwrite(tmp, np.zeros((100, 100, 3), dtype=np.uint8))
-        try:
-            self.RF.detect_faces(tmp)
-        except:
-            pass
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        print("[INIT] RetinaFace ✓ (background)")
-        self.ready = True
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def submit(self, frame):
-        with self.lock:
-            self.input_frame = frame.copy()
-            self.new_input = True
-
-    def get_results(self):
-        with self.lock:
-            return list(self.result_boxes)
-
-    def stop(self):
-        self.on = False
-
-    def _loop(self):
-        tmp = "/tmp/_rf_det.jpg"
-        while self.on:
-            frame = None
-            with self.lock:
-                if self.new_input:
-                    frame = self.input_frame
-                    self.new_input = False
-            if frame is None:
-                time.sleep(0.05)
-                continue
-            try:
-                cv2.imwrite(tmp, frame)
-                resp = self.RF.detect_faces(tmp)
-            except:
-                resp = {}
-            h, w = frame.shape[:2]
-            boxes = []
-            if isinstance(resp, dict):
-                for key in resp:
-                    face = resp[key]
-                    if face.get("score", 0) < RETINA_CONF:
-                        continue
-                    fa = face["facial_area"]
-                    x1, y1, x2, y2 = clamp(fa[0], fa[1], fa[2], fa[3], w, h)
-                    if x2 - x1 > 10 and y2 - y1 > 10:
-                        boxes.append((x1, y1, x2, y2))
-            with self.lock:
-                self.result_boxes = boxes
-
-    def detect_single(self, img):
-        tmp = "/tmp/_rf_aud.jpg"
-        cv2.imwrite(tmp, img)
-        try:
-            resp = self.RF.detect_faces(tmp)
-        except:
+        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (self.inp, self.inp), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        out = self.net.forward()
+        pred = np.squeeze(out)
+        if pred.ndim == 1:
             return []
-        h, w = img.shape[:2]
+        if pred.shape[0] < pred.shape[1]:
+            pred = pred.T
+
         boxes = []
-        if isinstance(resp, dict):
-            for key in resp:
-                if resp[key].get("score", 0) >= 0.50:
-                    fa = resp[key]["facial_area"]
-                    x1, y1, x2, y2 = clamp(fa[0], fa[1], fa[2], fa[3], w, h)
-                    if x2 - x1 > 10 and y2 - y1 > 10:
-                        boxes.append((x1, y1, x2, y2))
-        return boxes
+        scores = []
+        x_factor, y_factor = w / self.inp, h / self.inp
+
+        for row in pred:
+            if len(row) < 6:
+                continue
+            obj = float(row[4])
+            person_prob = float(row[5])
+            conf = obj * person_prob
+            if conf < self.conf:
+                continue
+            cx, cy, bw, bh = row[:4]
+            x1 = int((cx - bw / 2) * x_factor)
+            y1 = int((cy - bh / 2) * y_factor)
+            x2 = int((cx + bw / 2) * x_factor)
+            y2 = int((cy + bh / 2) * y_factor)
+            x1, y1, x2, y2 = clamp(x1, y1, x2, y2, w, h)
+            if _valid_person_box(x1, y1, x2, y2):
+                boxes.append([x1, y1, x2 - x1, y2 - y1])
+                scores.append(conf)
+
+        if not boxes:
+            return []
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, self.conf, 0.45)
+        if len(idxs) == 0:
+            return []
+        final_boxes = []
+        for idx in np.array(idxs).flatten():
+            x, y, bw, bh = boxes[int(idx)]
+            final_boxes.append((x, y, x + bw, y + bh))
+        return final_boxes
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -632,7 +587,7 @@ class Auditor:
         self.lock = lock
         self.on = True
         threading.Thread(target=self._loop, daemon=True).start()
-        print("[AUDIT] Started (every 30s)")
+        print("[AUDIT] Started (every 15s)")
 
     def stop(self):
         self.on = False
@@ -684,7 +639,7 @@ class Auditor:
                 valid[pn] = pdata
 
         for pn in to_del:
-            print(f"[AUDIT] Delete {pn} (no faces)")
+            print(f"[AUDIT] Delete {pn} (no people)")
             shutil.rmtree(os.path.join(FACES_DIR, pn), ignore_errors=True)
             with self.lock:
                 self.data.pop(pn, None)
@@ -783,7 +738,7 @@ def draw_frame(frame, tracks, n_det, fps, skip, backend):
                     font, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
     # HUD
-    hud = f"Faces:{n_det}  FPS:{fps:.0f}  Skip:{skip}  [{backend}]"
+    hud = f"People:{n_det}  FPS:{fps:.0f}  Skip:{skip}  [{backend}]"
     cv2.putText(frame, hud, (8, 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(frame, hud, (8, 22),
@@ -806,64 +761,43 @@ def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     # Download models
-    pp = os.path.join(MODEL_DIR, "deploy.prototxt")
-    cm = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
-    yp = os.path.join(MODEL_DIR, "face_detection_yunet_2023mar.onnx")
-    dl(PROTOTXT_URL, pp)
-    dl(CAFFE_URL, cm)
-    dl(YUNET_URL, yp)
+    pp = os.path.join(MODEL_DIR, "person_deploy.prototxt")
+    cm = os.path.join(MODEL_DIR, "person_mobilenet_iter_73000.caffemodel")
+    yp = os.path.join(MODEL_DIR, "yolov8n.onnx")
+    dl(PERSON_PROTO_URL, pp)
+    dl(PERSON_CAFFE_URL, cm)
+    dl(YOLO_PERSON_URL, yp)
 
-    # Fast detectors
+    # Fast detector (realtime)
     fast = []
     names = []
     try:
-        fast.append(SSD(pp, cm))
-        names.append("SSD")
+        fast.append(MobileNetSSDPerson(pp, cm))
+        names.append("MobileNet-SSD")
     except Exception as e:
-        print(f"[WARN] SSD: {e}")
-    if hasattr(cv2, "FaceDetectorYN"):
-        try:
-            fast.append(YuNetDet(yp))
-            names.append("YuNet")
-        except Exception as e:
-            print(f"[WARN] YuNet: {e}")
-    if not fast:
-        cp = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        if os.path.exists(cp):
-            cas = cv2.CascadeClassifier(cp)
+        print(f"[WARN] MobileNet-SSD: {e}")
 
-            class HW:
-                def detect(self, f):
-                    g = cv2.equalizeHist(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
-                    h_, w_ = f.shape[:2]
-                    return [(x, y, x + bw, y + bh)
-                            for x, y, bw, bh in
-                            cas.detectMultiScale(g, 1.1, 5, 0, (60, 60))]
-
-            fast.append(HW())
-            names.append("Haar")
-        else:
-            print("ERROR: No detector")
-            sys.exit(1)
-
-    # Optional RetinaFace
-    retina = None
+    # Strong model for audit / occasional runtime fusion
+    strong = None
     try:
-        retina = RetinaThread()
-        names.append("RetinaFace(bg)")
-    except ImportError:
-        print("[INFO] retina-face not installed — SSD+YuNet only")
-        print("       For best accuracy: pip install retina-face")
+        strong = YOLOPerson(yp)
+        names.append("YOLOv8n")
     except Exception as e:
-        print(f"[INFO] RetinaFace unavailable: {e}")
+        print(f"[WARN] YOLOv8n unavailable: {e}")
+
+    if not fast and not strong:
+        print("ERROR: No person detector available")
+        sys.exit(1)
 
     backend = " + ".join(names)
     print(f"\n[INIT] Detectors: {backend}")
 
     def audit_detect(img):
-        if retina and retina.ready:
-            return retina.detect_single(img)
-        return fast[0].detect(img) if fast else []
+        if strong:
+            return strong.detect(img)
+        if fast:
+            return fast[0].detect(img)
+        return []
 
     # Camera
     try:
@@ -891,8 +825,6 @@ def main():
     fpsd = deque(maxlen=60)
     n_det = 0
     display_tracks = []
-    retina_counter = 0
-    retina_interval = 6
 
     try:
         while True:
@@ -919,15 +851,12 @@ def main():
                     except:
                         all_boxes.append([])
 
-                # Merge RetinaFace results
-                if retina:
-                    rb = retina.get_results()
-                    if rb:
-                        all_boxes.append(rb)
-                    retina_counter += 1
-                    if retina_counter >= retina_interval:
-                        retina_counter = 0
-                        retina.submit(frame)
+                # Run stronger model less often to keep real-time FPS
+                if strong and (fc % (skip * 3) == 0):
+                    try:
+                        all_boxes.append(strong.detect(frame))
+                    except Exception:
+                        pass
 
                 fused = fuse_boxes(all_boxes)
                 n_det = len(fused)
@@ -955,15 +884,13 @@ def main():
             fps = len(fpsd) / max(sum(fpsd), 0.001)
 
             draw_frame(frame, display_tracks, n_det, fps, skip, backend)
-            cv2.imshow("Face Tracker", frame)
+            cv2.imshow("Person Tracker", frame)
 
             wait = max(1, int(1000.0 / TARGET_FPS - el * 1000))
             if cv2.waitKey(wait) & 0xFF == ord("q"):
                 break
 
     finally:
-        if retina:
-            retina.stop()
         auditor.stop()
         with lock:
             save_data(DATA_FILE, data)
