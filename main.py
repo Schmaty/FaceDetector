@@ -31,6 +31,7 @@ import sys
 import time
 import shutil
 import threading
+import queue
 import urllib.request
 import numpy as np
 from collections import deque
@@ -49,6 +50,11 @@ MIN_SKIP = 1
 MAX_AGE = 25                # frames a track survives without a match
 MIN_HITS = 3                # detections before a track is shown (confirmation)
 IOU_THRESHOLD = 0.25        # minimum IoU for matching detection → track
+MATCH_CENTER_DIST_RATIO = 1.1
+MATCH_SIZE_RATIO = 3.0
+REID_KEEP_SECONDS = 90.0
+REID_IOU_THRESHOLD = 0.2
+REID_CENTER_DIST_RATIO = 1.0
 
 # Persistence
 SAVE_COOLDOWN = 3.0
@@ -61,6 +67,11 @@ FAST_HOG_SCALE = 1.03
 STRONG_DNN_CONF = 0.72
 MIN_PERSON_PX = 64          # on detect-resolution frame
 
+# Face detector thresholds
+FACE_DNN_CONF = 0.60
+MIN_FACE_PX = 20
+FACE_DETECT_SKIP = 2
+
 # Auditor
 AUDIT_INTERVAL = 15
 AUDIT_HIST_CORREL = 0.80
@@ -71,8 +82,14 @@ FACES_DIR = "faces"
 MODEL_DIR = "models"
 DEADZONE = 40
 
-MOBILENET_PROTO_URL = "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt"
-MOBILENET_MODEL_URL = "https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel"
+MOBILENET_PROTO_URLS = [
+    "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/deploy.prototxt",
+    "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/MobileNetSSD_deploy.prototxt",
+]
+MOBILENET_MODEL_URLS = [
+    "https://github.com/chuanqi305/MobileNet-SSD/raw/master/mobilenet_iter_73000.caffemodel",
+    "https://github.com/chuanqi305/MobileNet-SSD/raw/master/MobileNetSSD_deploy.caffemodel",
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -96,14 +113,29 @@ def save_data(p, d):
 
 def dl(url, dest):
     if os.path.exists(dest):
-        return
+        return True
     print(f"[DL] {os.path.basename(dest)} ...")
     try:
         urllib.request.urlretrieve(url, dest)
         print("[DL] OK")
+        return True
     except Exception as e:
         print(f"[DL] FAIL: {e}")
-        sys.exit(1)
+        if os.path.exists(dest):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+        return False
+
+
+def dl_any(urls, dest):
+    if os.path.exists(dest):
+        return True
+    for url in urls:
+        if dl(url, dest):
+            return True
+    return False
 
 
 def iou_single(a, b):
@@ -134,6 +166,29 @@ def clamp(x1, y1, x2, y2, w, h):
 def scale_boxes(boxes, sx, sy):
     return [(int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy))
             for x1, y1, x2, y2 in boxes]
+
+
+def box_center(box):
+    return ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
+
+
+def box_area(box):
+    return max(1.0, float((box[2] - box[0]) * (box[3] - box[1])))
+
+
+def center_dist_ratio(a, b):
+    ax, ay = box_center(a)
+    bx, by = box_center(b)
+    d = np.hypot(ax - bx, ay - by)
+    scale = max(float(a[2] - a[0]), float(a[3] - a[1]),
+                float(b[2] - b[0]), float(b[3] - b[1]), 1.0)
+    return d / scale
+
+
+def size_ratio(a, b):
+    aa = box_area(a)
+    bb = box_area(b)
+    return max(aa, bb) / max(min(aa, bb), 1.0)
 
 
 def hist_of(img):
@@ -217,12 +272,14 @@ class KalmanBoxTracker:
         self.kf.statePost[4:, 0] = 0  # zero initial velocity
 
         self.name = name
+        self.display_name = name
         self.hits = 1           # total successful matches
         self.age = 0            # frames since creation
         self.time_since_update = 0  # frames since last match
         self.last_seen_time = time.time()
         self.last_save_time = 0.0
         self.active = True
+        self._use_pred_state = False
 
     def predict(self):
         """Advance state by one frame. Returns predicted box."""
@@ -232,6 +289,7 @@ class KalmanBoxTracker:
         self.kf.predict()
         self.age += 1
         self.time_since_update += 1
+        self._use_pred_state = True
         return self.get_box()
 
     def update(self, box):
@@ -243,11 +301,12 @@ class KalmanBoxTracker:
         self.last_seen_time = time.time()
         was_inactive = not self.active
         self.active = True
+        self._use_pred_state = False
         return was_inactive
 
     def get_box(self):
         """Current estimated box [x1, y1, x2, y2] as ints."""
-        state = self.kf.statePost[:4, 0]
+        state = self.kf.statePre[:4, 0] if self._use_pred_state else self.kf.statePost[:4, 0]
         box = z_to_box(state)
         return tuple(int(v) for v in box)
 
@@ -271,24 +330,36 @@ def match_detections_to_tracks(detections, trackers, iou_threshold=IOU_THRESHOLD
         return [], [], list(range(len(trackers)))
 
     iou_mat = iou_matrix(detections, trackers)
+    score_mat = np.full_like(iou_mat, -1.0, dtype=np.float32)
+
+    # Build a robust score matrix:
+    # 1) Prefer IoU matches
+    # 2) Allow close center-distance matches when IoU drops due to box jitter
+    for d in range(len(detections)):
+        for t in range(len(trackers)):
+            iou = float(iou_mat[d, t])
+            cdr = center_dist_ratio(detections[d], trackers[t])
+            sr = size_ratio(detections[d], trackers[t])
+            close_enough = (cdr <= MATCH_CENTER_DIST_RATIO and sr <= MATCH_SIZE_RATIO)
+            if iou >= iou_threshold or close_enough:
+                dist_score = max(0.0, 1.0 - cdr / max(MATCH_CENTER_DIST_RATIO, 1e-6))
+                score_mat[d, t] = iou + 0.25 * dist_score
 
     matches = []
     used_d = set()
     used_t = set()
 
-    # Iterate in order of highest IoU
-    while True:
-        if iou_mat.size == 0:
-            break
-        idx = np.unravel_index(np.argmax(iou_mat), iou_mat.shape)
+    # Greedy selection of highest-confidence pairs
+    while score_mat.size > 0:
+        idx = np.unravel_index(np.argmax(score_mat), score_mat.shape)
         d, t = int(idx[0]), int(idx[1])
-        if iou_mat[d, t] < iou_threshold:
+        if score_mat[d, t] < 0:
             break
-        if d not in used_d and t not in used_t:
-            matches.append((d, t))
-            used_d.add(d)
-            used_t.add(t)
-        iou_mat[d, t] = 0  # zero out so we pick next best
+        matches.append((d, t))
+        used_d.add(d)
+        used_t.add(t)
+        score_mat[d, :] = -1.0
+        score_mat[:, t] = -1.0
 
     unmatched_d = [i for i in range(len(detections)) if i not in used_d]
     unmatched_t = [i for i in range(len(trackers)) if i not in used_t]
@@ -304,6 +375,8 @@ class SORTTracker:
         self.trackers = []       # list of KalmanBoxTracker
         self.data = data
         self.frame_count = 0
+        self.just_confirmed = []
+        self.recently_lost = {}  # name -> {"box": (x1,y1,x2,y2), "ts": seconds}
         mx = 0
         for k in data:
             if k.startswith("Person_"):
@@ -318,6 +391,46 @@ class SORTTracker:
         self.next_id += 1
         return n
 
+    def _cleanup_recently_lost(self):
+        now = time.time()
+        stale = [name for name, rec in self.recently_lost.items()
+                 if now - rec["ts"] > REID_KEEP_SECONDS]
+        for name in stale:
+            self.recently_lost.pop(name, None)
+
+    def _remember_lost_identity(self, trk):
+        self.recently_lost[trk.name] = {
+            "box": trk.get_box(),
+            "ts": time.time(),
+        }
+
+    def _try_reuse_identity(self, box):
+        if not self.recently_lost:
+            return None
+        active_names = {t.name for t in self.trackers if t.time_since_update < MAX_AGE}
+        best_name = None
+        best_score = -1.0
+        for name, rec in self.recently_lost.items():
+            if name in active_names:
+                continue
+            old_box = rec["box"]
+            i = iou_single(box, old_box)
+            cdr = center_dist_ratio(box, old_box)
+            sr = size_ratio(box, old_box)
+            if (i >= REID_IOU_THRESHOLD) or (cdr <= REID_CENTER_DIST_RATIO and sr <= MATCH_SIZE_RATIO):
+                score = i + max(0.0, 1.0 - cdr / max(REID_CENTER_DIST_RATIO, 1e-6)) * 0.2
+                if score > best_score:
+                    best_score = score
+                    best_name = name
+        if best_name:
+            self.recently_lost.pop(best_name, None)
+        return best_name
+
+    def take_just_confirmed(self):
+        out = list(self.just_confirmed)
+        self.just_confirmed.clear()
+        return out
+
     def predict(self):
         """Predict all trackers forward one step. Call every frame."""
         for trk in self.trackers:
@@ -331,6 +444,8 @@ class SORTTracker:
         """
         self.frame_count += 1
         now = time.time()
+        self.just_confirmed.clear()
+        self._cleanup_recently_lost()
 
         # Get predicted boxes for matching
         pred_boxes = [trk.get_box() for trk in self.trackers]
@@ -344,18 +459,32 @@ class SORTTracker:
 
         # Update matched trackers
         for d, t in matches:
-            reappeared = self.trackers[t].update(detections[d])
-            if self.trackers[t].hits >= MIN_HITS:
-                results.append((self.trackers[t], reappeared and self.trackers[t].hits == MIN_HITS))
+            trk = self.trackers[t]
+            was_confirmed = trk.hits >= MIN_HITS
+            reappeared = trk.update(detections[d])
+            trk.display_name = self.data.get(trk.name, {}).get("display_name", trk.name)
+            if trk.hits >= MIN_HITS:
+                if not was_confirmed:
+                    self.just_confirmed.append(trk)
+                    print(f"[CONFIRMED] {trk.name}")
+                results.append((trk, reappeared and was_confirmed))
 
         # Create new trackers for unmatched detections
         for d in unmatched_d:
-            name = self._new_name()
+            name = self._try_reuse_identity(detections[d]) or self._new_name()
             trk = KalmanBoxTracker(detections[d], name)
+            trk.display_name = self.data.get(name, {}).get("display_name", name)
             self.trackers.append(trk)
-            self.data[name] = {"image_count": 0, "first_seen": time.time()}
+            if name not in self.data:
+                self.data[name] = {
+                    "image_count": 0,
+                    "first_seen": time.time(),
+                    "display_name": name,
+                }
+                print(f"[TRACK] New candidate {name}")
+            else:
+                print(f"[REID] Reusing {name}")
             os.makedirs(os.path.join(FACES_DIR, name), exist_ok=True)
-            print(f"[NEW] {name}")
             # Don't show until MIN_HITS reached
 
         # Mark inactive
@@ -383,6 +512,8 @@ class SORTTracker:
                 if os.path.isdir(d):
                     shutil.rmtree(d, ignore_errors=True)
                 self.data.pop(trk.name, None)
+            else:
+                self._remember_lost_identity(trk)
         self.trackers = [t for t in self.trackers if t.time_since_update < MAX_AGE]
 
         # De-duplicate overlapping active tracks
@@ -500,6 +631,81 @@ class StrongPersonSSD:
             b = (out[0, 0, i, 3:7] * [w, h, w, h]).astype(int)
             x1, y1, x2, y2 = clamp(b[0], b[1], b[2], b[3], w, h)
             if x2 - x1 >= MIN_PERSON_PX and y2 - y1 >= MIN_PERSON_PX * 2:
+                boxes.append((x1, y1, x2, y2))
+        return boxes
+
+
+class FaceDetector:
+    def __init__(self, model_dir):
+        self.impl = None
+        self.yunet = None
+        self.net = None
+
+        yunet_model = os.path.join(model_dir, "face_detection_yunet_2023mar.onnx")
+        if hasattr(cv2, "FaceDetectorYN") and os.path.exists(yunet_model):
+            try:
+                self.yunet = cv2.FaceDetectorYN.create(
+                    yunet_model, "", (320, 320), FACE_DNN_CONF, 0.3, 5000
+                )
+                self.impl = "YuNet"
+                print("[INIT] Face detector (YuNet) ✓")
+                return
+            except Exception as e:
+                print(f"[WARN] YuNet face detector unavailable: {e}")
+
+        proto = os.path.join(model_dir, "deploy.prototxt")
+        model = os.path.join(model_dir, "res10_300x300_ssd_iter_140000.caffemodel")
+        if os.path.exists(proto) and os.path.exists(model):
+            try:
+                self.net = cv2.dnn.readNetFromCaffe(proto, model)
+                self.impl = "Res10-SSD"
+                print("[INIT] Face detector (Res10-SSD) ✓")
+            except Exception as e:
+                print(f"[WARN] Res10 face detector unavailable: {e}")
+
+        if self.impl is None:
+            print("[WARN] Face detector unavailable.")
+
+    def ready(self):
+        return self.impl is not None
+
+    def detect(self, frame):
+        if self.impl is None:
+            return []
+        if self.impl == "YuNet":
+            return self._detect_yunet(frame)
+        return self._detect_res10(frame)
+
+    def _detect_yunet(self, frame):
+        h, w = frame.shape[:2]
+        self.yunet.setInputSize((w, h))
+        _, out = self.yunet.detect(frame)
+        if out is None:
+            return []
+        boxes = []
+        for row in out:
+            x, y, bw, bh = row[:4]
+            score = float(row[-1])
+            if score < FACE_DNN_CONF:
+                continue
+            x1, y1, x2, y2 = clamp(x, y, x + bw, y + bh, w, h)
+            if (x2 - x1) >= MIN_FACE_PX and (y2 - y1) >= MIN_FACE_PX:
+                boxes.append((x1, y1, x2, y2))
+        return boxes
+
+    def _detect_res10(self, frame):
+        h, w = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
+        self.net.setInput(blob)
+        out = self.net.forward()
+        boxes = []
+        for i in range(out.shape[2]):
+            conf = float(out[0, 0, i, 2])
+            if conf < FACE_DNN_CONF:
+                continue
+            b = (out[0, 0, i, 3:7] * [w, h, w, h]).astype(int)
+            x1, y1, x2, y2 = clamp(b[0], b[1], b[2], b[3], w, h)
+            if (x2 - x1) >= MIN_FACE_PX and (y2 - y1) >= MIN_FACE_PX:
                 boxes.append((x1, y1, x2, y2))
         return boxes
 
@@ -721,7 +927,53 @@ def save_photo(frame, trk, data, lock):
     print(f"[SAVE] {fp}")
 
 
-def draw_frame(frame, tracks, n_det, fps, skip, backend):
+class NamePrompter:
+    """Background console prompt for naming newly confirmed people."""
+    def __init__(self, data, lock):
+        self.data = data
+        self.lock = lock
+        self.q = queue.Queue()
+        self.pending = set()
+        self.on = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def request(self, person_key):
+        with self.lock:
+            label = self.data.get(person_key, {}).get("display_name", person_key)
+        if label != person_key:
+            return
+        if person_key in self.pending:
+            return
+        self.pending.add(person_key)
+        self.q.put(person_key)
+
+    def stop(self):
+        self.on = False
+        self.q.put(None)
+        self.thread.join(timeout=0.2)
+
+    def _loop(self):
+        while self.on:
+            person_key = self.q.get()
+            if person_key is None:
+                return
+            try:
+                txt = input(f"[NAME] Enter a name for {person_key} (blank=keep): ").strip()
+            except EOFError:
+                return
+            finally:
+                self.pending.discard(person_key)
+            if not txt:
+                continue
+            with self.lock:
+                if person_key in self.data:
+                    self.data[person_key]["display_name"] = txt
+                    save_data(DATA_FILE, self.data)
+            print(f"[NAME] {person_key} -> {txt}")
+
+
+def draw_frame(frame, tracks, face_boxes, n_det, fps, skip, backend):
     h, w = frame.shape[:2]
 
     for trk, _ in tracks:
@@ -734,7 +986,7 @@ def draw_frame(frame, tracks, n_det, fps, skip, backend):
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 230, 0), 2, cv2.LINE_AA)
 
         # Label background
-        lbl = trk.name
+        lbl = getattr(trk, "display_name", trk.name)
         font = cv2.FONT_HERSHEY_SIMPLEX
         (tw, th), baseline = cv2.getTextSize(lbl, font, 0.55, 1)
         cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1),
@@ -742,8 +994,13 @@ def draw_frame(frame, tracks, n_det, fps, skip, backend):
         cv2.putText(frame, lbl, (x1 + 3, y1 - 5),
                     font, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
+    for x1, y1, x2, y2 in face_boxes:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 180, 0), 2, cv2.LINE_AA)
+        cv2.putText(frame, "Face", (x1, max(14, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 0), 1, cv2.LINE_AA)
+
     # HUD
-    hud = f"People:{n_det}  FPS:{fps:.0f}  Skip:{skip}  [{backend}]"
+    hud = f"People:{n_det}  Faces:{len(face_boxes)}  FPS:{fps:.0f}  Skip:{skip}  [{backend}]"
     cv2.putText(frame, hud, (8, 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(frame, hud, (8, 22),
@@ -768,20 +1025,27 @@ def main():
     # Download stronger verifier model (used in background + auditor)
     proto = os.path.join(MODEL_DIR, "MobileNetSSD_deploy.prototxt")
     model = os.path.join(MODEL_DIR, "MobileNetSSD_deploy.caffemodel")
-    dl(MOBILENET_PROTO_URL, proto)
-    dl(MOBILENET_MODEL_URL, model)
+    proto_ok = dl_any(MOBILENET_PROTO_URLS, proto)
+    model_ok = dl_any(MOBILENET_MODEL_URLS, model)
+    strong_assets_ready = proto_ok and model_ok
+    if not strong_assets_ready:
+        print("[WARN] MobileNet-SSD model download failed; using HOG only.")
 
     # Fast detector path
     fast = [FastPersonHOG()]
     names = ["HOG"]
+    face_detector = FaceDetector(MODEL_DIR)
+    if face_detector.ready():
+        names.append(f"Face({face_detector.impl})")
 
     # Strong verifier in background (lower cadence, higher precision)
     strong_thread = None
-    try:
-        strong_thread = StrongPersonThread(StrongPersonSSD(proto, model))
-        names.append("MobileNet-SSD(bg)")
-    except Exception as e:
-        print(f"[WARN] MobileNet-SSD unavailable: {e}")
+    if strong_assets_ready:
+        try:
+            strong_thread = StrongPersonThread(StrongPersonSSD(proto, model))
+            names.append("MobileNet-SSD(bg)")
+        except Exception as e:
+            print(f"[WARN] MobileNet-SSD unavailable: {e}")
 
     backend = " + ".join(names)
     print(f"\n[INIT] Detectors: {backend}")
@@ -811,12 +1075,16 @@ def main():
     # Tracker + auditor
     tracker = SORTTracker(data)
     auditor = Auditor(audit_detect, data, lock)
+    name_prompter = NamePrompter(data, lock) if sys.stdin.isatty() else None
+    if name_prompter is None:
+        print("[WARN] Name prompt disabled (stdin not interactive).")
 
     skip = 2
     fc = 0
     fpsd = deque(maxlen=60)
     n_det = 0
     display_tracks = []
+    face_boxes = []
     strong_counter = 0
     strong_interval = 8
 
@@ -863,17 +1131,28 @@ def main():
                 elif det_ms < budget * 0.2 and skip > MIN_SKIP:
                     skip -= 1
 
-                for trk, new in display_tracks:
-                    if new:
-                        save_photo(frame, trk, data, lock)
+                for trk in tracker.take_just_confirmed():
+                    save_photo(frame, trk, data, lock)
+                    if name_prompter:
+                        name_prompter.request(trk.name)
             else:
                 display_tracks = tracker.get_display_tracks()
+
+            with lock:
+                for trk, _ in display_tracks:
+                    trk.display_name = data.get(trk.name, {}).get("display_name", trk.name)
+
+            if face_detector.ready() and (fc % FACE_DETECT_SKIP == 0):
+                try:
+                    face_boxes = face_detector.detect(frame)
+                except Exception:
+                    face_boxes = []
 
             el = time.time() - t0
             fpsd.append(el)
             fps = len(fpsd) / max(sum(fpsd), 0.001)
 
-            draw_frame(frame, display_tracks, n_det, fps, skip, backend)
+            draw_frame(frame, display_tracks, face_boxes, n_det, fps, skip, backend)
             cv2.imshow("Person Tracker", frame)
 
             wait = max(1, int(1000.0 / TARGET_FPS - el * 1000))
@@ -884,6 +1163,8 @@ def main():
         if strong_thread:
             strong_thread.stop()
         auditor.stop()
+        if name_prompter:
+            name_prompter.stop()
         with lock:
             save_data(DATA_FILE, data)
         cam.release()
