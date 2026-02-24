@@ -1,30 +1,3 @@
-"""
-Face Detection & Tracking — SORT-Style Kalman Tracker
-======================================================
-WHY THIS IS DIFFERENT:
-
-Every previous version used simple centroid distance + EMA smoothing.
-That breaks when faces move fast, rotate, or skip between detection frames.
-
-This version uses a Kalman Filter tracker (the same algorithm used in
-SORT — Simple Online and Realtime Tracking, the industry standard).
-
-Each tracked face has a Kalman state: [cx, cy, w, h, vx, vy, vw, vh]
-  • Predicts WHERE the face will be next frame (velocity-aware)
-  • Boxes stay locked on during fast head turns and movement
-  • Between detection frames, Kalman prediction keeps boxes smooth
-  • Matching uses predicted positions, not stale last-seen positions
-  • Handles faces teleporting across screen between detections
-
-Detection: SSD + YuNet (fast, on downscaled frames)
-Optional:  RetinaFace in background thread for bonus accuracy
-Auditor:   Background thread cleans false positives & merges duplicates
-
-Requirements:
-    pip install opencv-python numpy           # minimum (Pi 5 + Mac)
-    pip install retina-face                    # optional (best accuracy)
-"""
-
 import cv2
 import json
 import os
@@ -32,6 +5,7 @@ import sys
 import time
 import shutil
 import threading
+import queue
 import urllib.request
 import numpy as np
 from collections import deque
@@ -42,28 +16,31 @@ from collections import deque
 
 CAMERA_INDEX = 0
 TARGET_FPS = 30
-DETECT_WIDTH = 420          # downscale to this width for detection speed
-MAX_SKIP = 6                # max frames between detections
+MAX_SKIP = 6
 MIN_SKIP = 1
 
-# Kalman tracker
-MAX_AGE = 25                # frames a track survives without a match
-MIN_HITS = 3                # detections before a track is shown (confirmation)
-IOU_THRESHOLD = 0.25        # minimum IoU for matching detection → track
+# Tracker
+MAX_AGE = 30          # frames a confirmed track survives without a match
+MIN_HITS = 4          # consecutive detections before a candidate graduates
+CAND_MAX_AGE = 8      # frames a candidate survives without a match
+IOU_THRESHOLD = 0.20
+MATCH_CDR = 1.5       # center-distance-ratio threshold for fallback matching
+MATCH_SR = 4.0        # size-ratio threshold
 
-# Persistence
-SAVE_COOLDOWN = 3.0
-INACTIVE_TIMEOUT = 1.5      # seconds before marking inactive for photo logic
-DEDUP_IOU = 0.5
+# Re-identification
+REID_SECONDS = 60.0
+REID_CDR = 2.0
 
-# Detector thresholds
-DNN_CONF = 0.52
-YUNET_CONF = 0.65
-RETINA_CONF = 0.80
-MIN_FACE_PX = 30            # on detect-resolution frame
+# Save
+SAVE_COOLDOWN = 5.0
+DEDUP_IOU = 0.45
+
+# Face detection
+FACE_CONF = 0.55
+MIN_FACE_PX = 20
 
 # Auditor
-AUDIT_INTERVAL = 30
+AUDIT_INTERVAL = 20
 AUDIT_HIST_CORREL = 0.80
 
 # Paths
@@ -72,9 +49,9 @@ FACES_DIR = "faces"
 MODEL_DIR = "models"
 DEADZONE = 40
 
-PROTOTXT_URL = "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/deploy.prototxt"
-CAFFE_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+FACE_PROTO_URL = "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/deploy.prototxt"
+FACE_MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -82,344 +59,283 @@ YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_data(p):
-    if os.path.exists(p):
-        try:
-            with open(p) as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
-
+    try:
+        with open(p) as f: return json.load(f)
+    except: return {}
 
 def save_data(p, d):
-    with open(p, "w") as f:
-        json.dump(d, f, indent=2)
-
+    with open(p, "w") as f: json.dump(d, f, indent=2)
 
 def dl(url, dest):
-    if os.path.exists(dest):
-        return
+    if os.path.exists(dest): return True
     print(f"[DL] {os.path.basename(dest)} ...")
     try:
-        urllib.request.urlretrieve(url, dest)
-        print("[DL] OK")
+        urllib.request.urlretrieve(url, dest); print("[DL] OK"); return True
     except Exception as e:
         print(f"[DL] FAIL: {e}")
-        sys.exit(1)
+        try: os.remove(dest)
+        except: pass
+        return False
 
+def iou(a, b):
+    xa, ya = max(a[0],b[0]), max(a[1],b[1])
+    xb, yb = min(a[2],b[2]), min(a[3],b[3])
+    inter = max(0,xb-xa)*max(0,yb-ya)
+    if inter == 0: return 0.0
+    return inter/((a[2]-a[0])*(a[3]-a[1])+(b[2]-b[0])*(b[3]-b[1])-inter)
 
-def iou_single(a, b):
-    """IoU between two boxes [x1,y1,x2,y2]."""
-    xa, ya = max(a[0], b[0]), max(a[1], b[1])
-    xb, yb = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0, xb - xa) * max(0, yb - ya)
-    if inter == 0:
-        return 0.0
-    aa = (a[2] - a[0]) * (a[3] - a[1])
-    ab = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / (aa + ab - inter)
+def clamp(x1,y1,x2,y2,w,h):
+    return max(0,int(x1)),max(0,int(y1)),min(w,int(x2)),min(h,int(y2))
 
+def box_center(b): return ((b[0]+b[2])*0.5, (b[1]+b[3])*0.5)
+def box_area(b): return max(1.0, float((b[2]-b[0])*(b[3]-b[1])))
 
-def iou_matrix(dets, trks):
-    """Compute IoU matrix between detections and tracks. Shape: (D, T)."""
-    m = np.zeros((len(dets), len(trks)), dtype=np.float32)
-    for d in range(len(dets)):
-        for t in range(len(trks)):
-            m[d, t] = iou_single(dets[d], trks[t])
-    return m
+def cdr(a, b):
+    """Center distance ratio — distance between centers / max dimension."""
+    ax,ay = box_center(a); bx,by = box_center(b)
+    d = np.hypot(ax-bx, ay-by)
+    s = max(a[2]-a[0], a[3]-a[1], b[2]-b[0], b[3]-b[1], 1.0)
+    return d / s
 
-
-def clamp(x1, y1, x2, y2, w, h):
-    return max(0, int(x1)), max(0, int(y1)), min(w, int(x2)), min(h, int(y2))
-
-
-def scale_boxes(boxes, sx, sy):
-    return [(int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy))
-            for x1, y1, x2, y2 in boxes]
-
+def sr(a, b):
+    """Size ratio — how different are the box areas."""
+    aa, bb = box_area(a), box_area(b)
+    return max(aa,bb)/max(min(aa,bb),1.0)
 
 def hist_of(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    h = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
-    cv2.normalize(h, h)
-    return h
+    h = cv2.calcHist([hsv],[0,1],None,[32,32],[0,180,0,256])
+    cv2.normalize(h,h); return h
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# KALMAN BOX TRACKER — the core of smooth tracking
+# KALMAN BOX TRACKER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def box_to_z(box):
-    """[x1,y1,x2,y2] → [cx, cy, area, aspect_ratio]"""
-    w = box[2] - box[0]
-    h = box[3] - box[1]
-    cx = box[0] + w / 2.0
-    cy = box[1] + h / 2.0
-    return np.array([cx, cy, w * h, w / max(h, 1e-6)], dtype=np.float32)
-
+    w,h = box[2]-box[0], box[3]-box[1]
+    return np.array([box[0]+w/2, box[1]+h/2, w*h, w/max(h,1e-6)], dtype=np.float32)
 
 def z_to_box(z):
-    """[cx, cy, area, aspect_ratio] → [x1, y1, x2, y2]"""
-    w = np.sqrt(max(z[2] * z[3], 1e-6))
-    h = max(z[2] / max(w, 1e-6), 1e-6)
-    return np.array([
-        z[0] - w / 2.0,
-        z[1] - h / 2.0,
-        z[0] + w / 2.0,
-        z[1] + h / 2.0,
-    ], dtype=np.float32)
+    w = np.sqrt(max(z[2]*z[3], 1e-6))
+    h = max(z[2]/max(w,1e-6), 1e-6)
+    return (int(z[0]-w/2), int(z[1]-h/2), int(z[0]+w/2), int(z[1]+h/2))
 
 
-class KalmanBoxTracker:
-    """
-    Kalman filter for a single tracked face.
-
-    State: [cx, cy, area, ratio, v_cx, v_cy, v_area]
-      - Tracks position, size, AND velocity
-      - Predicts next position even without a detection
-      - Handles fast movement naturally through velocity terms
-
-    This is the same approach used in SORT (Bewley et al., 2016).
-    """
-    _count = 0
-
-    def __init__(self, box, name):
-        self.kf = cv2.KalmanFilter(7, 4)  # 7 state dims, 4 measurement dims
-
-        # Transition matrix (constant velocity model)
-        self.kf.transitionMatrix = np.array([
-            [1, 0, 0, 0, 1, 0, 0],
-            [0, 1, 0, 0, 0, 1, 0],
-            [0, 0, 1, 0, 0, 0, 1],
-            [0, 0, 0, 1, 0, 0, 0],
-            [0, 0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 0, 0, 1],
-        ], dtype=np.float32)
-
-        # Measurement matrix
-        self.kf.measurementMatrix = np.array([
-            [1, 0, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0, 0],
-            [0, 0, 1, 0, 0, 0, 0],
-            [0, 0, 0, 1, 0, 0, 0],
-        ], dtype=np.float32)
-
-        # Noise covariances (tuned for face tracking)
+class KalmanTrack:
+    """Kalman filter for one tracked face. State: [cx,cy,area,ratio,vx,vy,va]."""
+    def __init__(self, box):
+        self.kf = cv2.KalmanFilter(7, 4)
+        self.kf.transitionMatrix = np.eye(7, dtype=np.float32)
+        self.kf.transitionMatrix[0,4] = 1  # cx += vx
+        self.kf.transitionMatrix[1,5] = 1  # cy += vy
+        self.kf.transitionMatrix[2,6] = 1  # area += va
+        self.kf.measurementMatrix = np.zeros((4,7), dtype=np.float32)
+        np.fill_diagonal(self.kf.measurementMatrix, 1)
         self.kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 1.0
         self.kf.processNoiseCov = np.eye(7, dtype=np.float32)
-        self.kf.processNoiseCov[4:, 4:] *= 0.01  # low velocity noise
-        self.kf.processNoiseCov[:4, :4] *= 10.0   # higher position noise
+        self.kf.processNoiseCov[4:,4:] *= 0.01
+        self.kf.processNoiseCov[:4,:4] *= 10.0
         self.kf.errorCovPost = np.eye(7, dtype=np.float32)
-        self.kf.errorCovPost[4:, 4:] *= 1000.0    # high initial velocity uncertainty
-
-        # Init state from first measurement
+        self.kf.errorCovPost[4:,4:] *= 1000.0
         z = box_to_z(box)
-        self.kf.statePost[:4, 0] = z
-        self.kf.statePost[4:, 0] = 0  # zero initial velocity
-
-        self.name = name
-        self.hits = 1           # total successful matches
-        self.age = 0            # frames since creation
-        self.time_since_update = 0  # frames since last match
-        self.last_seen_time = time.time()
-        self.last_save_time = 0.0
-        self.active = True
+        self.kf.statePost[:4,0] = z
+        self.kf.statePost[4:,0] = 0
+        self.time_since_update = 0
+        self.hits = 1
+        self.age = 0
 
     def predict(self):
-        """Advance state by one frame. Returns predicted box."""
-        # Prevent area from going negative
-        if self.kf.statePost[2, 0] + self.kf.statePost[6, 0] <= 0:
-            self.kf.statePost[6, 0] = 0.0
+        if self.kf.statePost[2,0] + self.kf.statePost[6,0] <= 0:
+            self.kf.statePost[6,0] = 0.0
         self.kf.predict()
         self.age += 1
         self.time_since_update += 1
-        return self.get_box()
 
     def update(self, box):
-        """Correct state with a matched detection."""
-        z = box_to_z(box)
-        self.kf.correct(z.reshape(4, 1))
+        self.kf.correct(box_to_z(box).reshape(4,1))
         self.hits += 1
         self.time_since_update = 0
-        self.last_seen_time = time.time()
-        was_inactive = not self.active
-        self.active = True
-        return was_inactive
 
     def get_box(self):
-        """Current estimated box [x1, y1, x2, y2] as ints."""
-        state = self.kf.statePost[:4, 0]
-        box = z_to_box(state)
-        return tuple(int(v) for v in box)
+        # Use statePre after predict (predicted), statePost after correct (filtered)
+        if self.time_since_update > 0:
+            return z_to_box(self.kf.statePre[:4,0])
+        return z_to_box(self.kf.statePost[:4,0])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HUNGARIAN-STYLE MATCHING
+# MATCHING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def match_detections_to_tracks(detections, trackers, iou_threshold=IOU_THRESHOLD):
-    """
-    Match detections to tracked objects using IoU.
-    Returns: (matches, unmatched_dets, unmatched_trks)
+def match(detections, track_boxes):
+    """Greedy IoU + center-distance matching. Returns (matches, unmatched_d, unmatched_t)."""
+    if not track_boxes: return [], list(range(len(detections))), []
+    if not detections: return [], [], list(range(len(track_boxes)))
 
-    Uses greedy matching on IoU matrix (fast, and optimal enough for <20 faces).
-    For strict optimality you'd use scipy.optimize.linear_sum_assignment,
-    but greedy works perfectly for typical face counts.
-    """
-    if len(trackers) == 0:
-        return [], list(range(len(detections))), []
-    if len(detections) == 0:
-        return [], [], list(range(len(trackers)))
+    nd, nt = len(detections), len(track_boxes)
+    scores = np.full((nd, nt), -1.0, dtype=np.float32)
+    for d in range(nd):
+        for t in range(nt):
+            iv = iou(detections[d], track_boxes[t])
+            c = cdr(detections[d], track_boxes[t])
+            s = sr(detections[d], track_boxes[t])
+            if iv >= IOU_THRESHOLD or (c <= MATCH_CDR and s <= MATCH_SR):
+                scores[d,t] = iv + 0.3 * max(0.0, 1.0 - c/MATCH_CDR)
 
-    iou_mat = iou_matrix(detections, trackers)
-
-    matches = []
-    used_d = set()
-    used_t = set()
-
-    # Iterate in order of highest IoU
-    while True:
-        if iou_mat.size == 0:
-            break
-        idx = np.unravel_index(np.argmax(iou_mat), iou_mat.shape)
+    matches = []; ud, ut = set(), set()
+    for _ in range(min(nd, nt)):
+        idx = np.unravel_index(np.argmax(scores), scores.shape)
         d, t = int(idx[0]), int(idx[1])
-        if iou_mat[d, t] < iou_threshold:
-            break
-        if d not in used_d and t not in used_t:
-            matches.append((d, t))
-            used_d.add(d)
-            used_t.add(t)
-        iou_mat[d, t] = 0  # zero out so we pick next best
+        if scores[d,t] < 0: break
+        matches.append((d, t)); ud.add(d); ut.add(t)
+        scores[d,:] = -1; scores[:,t] = -1
 
-    unmatched_d = [i for i in range(len(detections)) if i not in used_d]
-    unmatched_t = [i for i in range(len(trackers)) if i not in used_t]
-    return matches, unmatched_d, unmatched_t
+    return matches, [i for i in range(nd) if i not in ud], [i for i in range(nt) if i not in ut]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SORT TRACKER (manages all KalmanBoxTrackers)
+# TRACKER — with candidate pool (the key fix)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class SORTTracker:
+class PersonTrack:
+    """A confirmed track with a Person_N identity."""
+    def __init__(self, name, kalman):
+        self.name = name
+        self.display_name = name
+        self.kf = kalman
+        self.last_seen = time.time()
+        self.last_save = 0.0
+        self.saved_once = False
+
+class Tracker:
     def __init__(self, data):
-        self.trackers = []       # list of KalmanBoxTracker
+        self.confirmed = []     # list of PersonTrack (have Person_N IDs)
+        self.candidates = []    # list of KalmanTrack (anonymous, no ID)
         self.data = data
-        self.frame_count = 0
+        self.just_graduated = []
+        self.recently_lost = {} # name -> {"box":..., "ts":...}
         mx = 0
         for k in data:
             if k.startswith("Person_"):
-                try:
-                    mx = max(mx, int(k.split("_")[1]))
-                except:
-                    pass
+                try: mx = max(mx, int(k.split("_")[1]))
+                except: pass
         self.next_id = mx + 1
 
     def _new_name(self):
-        n = f"Person_{self.next_id}"
-        self.next_id += 1
-        return n
+        n = f"Person_{self.next_id}"; self.next_id += 1; return n
+
+    def _try_reuse(self, box):
+        """Check if a graduating candidate matches a recently-lost identity."""
+        active = {t.name for t in self.confirmed}
+        best, best_sc = None, -1.0
+        now = time.time()
+        # Clean stale
+        stale = [n for n,r in self.recently_lost.items() if now-r["ts"]>REID_SECONDS]
+        for n in stale: self.recently_lost.pop(n,None)
+        # Find best match
+        for name, rec in self.recently_lost.items():
+            if name in active: continue
+            c = cdr(box, rec["box"])
+            if c <= REID_CDR:
+                sc = 1.0 - c/REID_CDR
+                if sc > best_sc: best_sc, best = sc, name
+        if best: self.recently_lost.pop(best, None)
+        return best
 
     def predict(self):
-        """Predict all trackers forward one step. Call every frame."""
-        for trk in self.trackers:
-            trk.predict()
+        for t in self.confirmed: t.kf.predict()
+        for c in self.candidates: c.predict()
 
     def update(self, detections):
         """
-        Update tracker with new detections.
-        Call on frames where detection ran.
-        Returns list of (KalmanBoxTracker, newly_appeared: bool) for display.
+        1. Match detections to confirmed tracks
+        2. Match remaining detections to candidates
+        3. Remaining detections become new candidates (anonymous — NO Person_N)
+        4. Candidates that reach MIN_HITS graduate to confirmed tracks
         """
-        self.frame_count += 1
-        now = time.time()
+        self.just_graduated.clear()
 
-        # Get predicted boxes for matching
-        pred_boxes = [trk.get_box() for trk in self.trackers]
+        # ── Step 1: Match detections → confirmed tracks ──────────────────
+        conf_boxes = [t.kf.get_box() for t in self.confirmed]
+        m1, ud1, ut1 = match(detections, conf_boxes)
 
-        # Match
-        matches, unmatched_d, unmatched_t = match_detections_to_tracks(
-            detections, pred_boxes, IOU_THRESHOLD
-        )
+        for d, t in m1:
+            self.confirmed[t].kf.update(detections[d])
+            self.confirmed[t].last_seen = time.time()
 
-        results = []
+        # ── Step 2: Match remaining detections → candidates ──────────────
+        remaining_dets = [detections[d] for d in ud1]
+        cand_boxes = [c.get_box() for c in self.candidates]
+        m2, ud2, ut2 = match(remaining_dets, cand_boxes)
 
-        # Update matched trackers
-        for d, t in matches:
-            reappeared = self.trackers[t].update(detections[d])
-            if self.trackers[t].hits >= MIN_HITS:
-                results.append((self.trackers[t], reappeared and self.trackers[t].hits == MIN_HITS))
+        for d, t in m2:
+            self.candidates[t].update(remaining_dets[d])
 
-        # Create new trackers for unmatched detections
-        for d in unmatched_d:
-            name = self._new_name()
-            trk = KalmanBoxTracker(detections[d], name)
-            self.trackers.append(trk)
-            self.data[name] = {"image_count": 0, "first_seen": time.time()}
-            os.makedirs(os.path.join(FACES_DIR, name), exist_ok=True)
-            print(f"[NEW] {name}")
-            # Don't show until MIN_HITS reached
+        # ── Step 3: Leftover detections become new anonymous candidates ──
+        for d in ud2:
+            self.candidates.append(KalmanTrack(remaining_dets[d]))
 
-        # Mark inactive
-        for t in unmatched_t:
-            if now - self.trackers[t].last_seen_time > INACTIVE_TIMEOUT:
-                self.trackers[t].active = False
+        # ── Step 4: Graduate candidates that reached MIN_HITS ────────────
+        still_cands = []
+        for c in self.candidates:
+            if c.hits >= MIN_HITS:
+                # This candidate has been seen enough times — promote it
+                box = c.get_box()
+                name = self._try_reuse(box) or self._new_name()
+                pt = PersonTrack(name, c)
+                pt.display_name = self.data.get(name, {}).get("display_name", name)
+                if name in self.data and self.data[name].get("image_count",0) > 0:
+                    pt.saved_once = True
+                self.confirmed.append(pt)
+                if name not in self.data:
+                    self.data[name] = {
+                        "image_count": 0, "first_seen": time.time(),
+                        "display_name": name,
+                    }
+                os.makedirs(os.path.join(FACES_DIR, name), exist_ok=True)
+                self.just_graduated.append(pt)
+                print(f"[CONFIRMED] {name}")
+            elif c.time_since_update < CAND_MAX_AGE:
+                still_cands.append(c)
+            # else: candidate expired silently — no ID, no directory, no cost
+        self.candidates = still_cands
 
-        # Return confirmed tracks that are alive
-        for trk in self.trackers:
-            if trk.time_since_update == 0 and trk.hits >= MIN_HITS:
-                # Already added in matches loop
-                pass
-            elif trk.time_since_update < MAX_AGE and trk.hits >= MIN_HITS:
-                # Still coasting — show predicted box
-                already = any(r[0].name == trk.name for r in results)
-                if not already:
-                    results.append((trk, False))
+        # ── Step 5: Remove dead confirmed tracks ─────────────────────────
+        alive, dead = [], []
+        for t in self.confirmed:
+            if t.kf.time_since_update < MAX_AGE:
+                alive.append(t)
+            else:
+                dead.append(t)
+        for t in dead:
+            self.recently_lost[t.name] = {"box": t.kf.get_box(), "ts": time.time()}
+        self.confirmed = alive
 
-        # Remove dead tracks
-        dead = [trk for trk in self.trackers if trk.time_since_update >= MAX_AGE]
-        for trk in dead:
-            if trk.hits < MIN_HITS:
-                # Never confirmed — clean up
-                d = os.path.join(FACES_DIR, trk.name)
-                if os.path.isdir(d):
-                    shutil.rmtree(d, ignore_errors=True)
-                self.data.pop(trk.name, None)
-        self.trackers = [t for t in self.trackers if t.time_since_update < MAX_AGE]
-
-        # De-duplicate overlapping active tracks
+        # ── Step 6: Dedup overlapping confirmed tracks ───────────────────
         self._dedup()
 
-        return results
-
-    def get_display_tracks(self):
-        """Get all confirmed, recently-seen tracks for drawing between detections."""
-        return [(trk, False) for trk in self.trackers
-                if trk.hits >= MIN_HITS and trk.time_since_update < MAX_AGE]
+    def get_display(self):
+        """Return confirmed tracks for drawing."""
+        return self.confirmed
 
     def _dedup(self):
-        if len(self.trackers) < 2:
-            return
+        if len(self.confirmed) < 2: return
         rm = set()
-        for i in range(len(self.trackers)):
-            if i in rm:
-                continue
-            for j in range(i + 1, len(self.trackers)):
-                if j in rm:
-                    continue
-                if iou_single(self.trackers[i].get_box(),
-                              self.trackers[j].get_box()) > DEDUP_IOU:
-                    # Remove the one with fewer hits
-                    victim_idx = j if self.trackers[j].hits < self.trackers[i].hits else i
-                    rm.add(victim_idx)
-                    v = self.trackers[victim_idx].name
+        for i in range(len(self.confirmed)):
+            if i in rm: continue
+            for j in range(i+1, len(self.confirmed)):
+                if j in rm: continue
+                if iou(self.confirmed[i].kf.get_box(),
+                       self.confirmed[j].kf.get_box()) > DEDUP_IOU:
+                    vi = j if self.confirmed[j].kf.hits < self.confirmed[i].kf.hits else i
+                    rm.add(vi)
+                    v = self.confirmed[vi].name
                     print(f"[DEDUP] {v}")
-                    d = os.path.join(FACES_DIR, v)
-                    if os.path.isdir(d):
-                        shutil.rmtree(d, ignore_errors=True)
+                    shutil.rmtree(os.path.join(FACES_DIR,v), ignore_errors=True)
                     self.data.pop(v, None)
         if rm:
-            self.trackers = [t for idx, t in enumerate(self.trackers) if idx not in rm]
+            self.confirmed = [t for i,t in enumerate(self.confirmed) if i not in rm]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -429,195 +345,111 @@ class SORTTracker:
 class Cam:
     def __init__(self, src=0):
         self.cap = cv2.VideoCapture(src)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {src}")
+        if not self.cap.isOpened(): raise RuntimeError(f"Cannot open camera {src}")
         self.ret, self.frame = self.cap.read()
         self.lock = threading.Lock()
         self.on = True
-        threading.Thread(target=self._go, daemon=True).start()
-
-    def _go(self):
+        threading.Thread(target=self._run, daemon=True).start()
+    def _run(self):
         while self.on:
             r, f = self.cap.read()
-            with self.lock:
-                self.ret, self.frame = r, f
-
+            with self.lock: self.ret, self.frame = r, f
     def read(self):
         with self.lock:
-            if self.frame is not None:
-                return self.ret, self.frame.copy()
-            return False, None
-
+            return (self.ret, self.frame.copy()) if self.frame is not None else (False, None)
     def release(self):
-        self.on = False
-        time.sleep(0.1)
-        self.cap.release()
+        self.on = False; time.sleep(0.1); self.cap.release()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DETECTORS
+# FACE DETECTOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class SSD:
-    def __init__(self, proto, model):
-        self.net = cv2.dnn.readNetFromCaffe(proto, model)
-        print("[INIT] SSD ResNet-10 ✓")
+class FaceDetector:
+    def __init__(self):
+        self.impl = None
+        os.makedirs(MODEL_DIR, exist_ok=True)
+
+        # Try YuNet first (faster, more accurate)
+        yp = os.path.join(MODEL_DIR, "yunet_2023mar.onnx")
+        dl(YUNET_URL, yp)
+        if hasattr(cv2, "FaceDetectorYN") and os.path.exists(yp):
+            try:
+                self.yunet = cv2.FaceDetectorYN.create(yp,"", (320,320), FACE_CONF, 0.3, 5000)
+                self.impl = "YuNet"
+                print("[INIT] Face detector: YuNet ✓")
+                return
+            except Exception as e:
+                print(f"[WARN] YuNet: {e}")
+
+        # Fallback: Res10-SSD
+        pp = os.path.join(MODEL_DIR, "face_deploy.prototxt")
+        mp = os.path.join(MODEL_DIR, "res10_face.caffemodel")
+        dl(FACE_PROTO_URL, pp); dl(FACE_MODEL_URL, mp)
+        if os.path.exists(pp) and os.path.exists(mp):
+            try:
+                self.net = cv2.dnn.readNetFromCaffe(pp, mp)
+                self.impl = "Res10-SSD"
+                print("[INIT] Face detector: Res10-SSD ✓")
+                return
+            except Exception as e:
+                print(f"[WARN] Res10: {e}")
+
+        print("[ERROR] No face detector available!")
+        sys.exit(1)
 
     def detect(self, frame):
+        if self.impl == "YuNet": return self._yunet(frame)
+        return self._res10(frame)
+
+    def _yunet(self, frame):
         h, w = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
+        self.yunet.setInputSize((w, h))
+        _, out = self.yunet.detect(frame)
+        if out is None: return []
+        boxes = []
+        for row in out:
+            x,y,bw,bh = row[:4]; score = float(row[-1])
+            if score < FACE_CONF: continue
+            x1,y1,x2,y2 = clamp(x, y, x+bw, y+bh, w, h)
+            if x2-x1 >= MIN_FACE_PX and y2-y1 >= MIN_FACE_PX:
+                boxes.append((x1,y1,x2,y2))
+        return boxes
+
+    def _res10(self, frame):
+        h, w = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1.0, (300,300), (104.0,177.0,123.0))
         self.net.setInput(blob)
         out = self.net.forward()
         boxes = []
         for i in range(out.shape[2]):
-            c = out[0, 0, i, 2]
-            if c < DNN_CONF:
-                continue
-            b = (out[0, 0, i, 3:7] * [w, h, w, h]).astype(int)
-            x1, y1, x2, y2 = clamp(b[0], b[1], b[2], b[3], w, h)
-            if x2 - x1 >= MIN_FACE_PX and y2 - y1 >= MIN_FACE_PX:
-                boxes.append((x1, y1, x2, y2))
-        return boxes
-
-
-class YuNetDet:
-    def __init__(self, path):
-        self.d = cv2.FaceDetectorYN.create(
-            path, "", (320, 320), YUNET_CONF, 0.3, 5000)
-        print("[INIT] YuNet ✓")
-
-    def detect(self, frame):
-        h, w = frame.shape[:2]
-        self.d.setInputSize((w, h))
-        _, faces = self.d.detect(frame)
-        boxes = []
-        if faces is not None:
-            for f in faces:
-                x1, y1 = int(f[0]), int(f[1])
-                x2, y2 = x1 + int(f[2]), y1 + int(f[3])
-                x1, y1, x2, y2 = clamp(x1, y1, x2, y2, w, h)
-                if x2 - x1 >= MIN_FACE_PX and y2 - y1 >= MIN_FACE_PX:
-                    boxes.append((x1, y1, x2, y2))
+            if out[0,0,i,2] < FACE_CONF: continue
+            b = (out[0,0,i,3:7]*[w,h,w,h]).astype(int)
+            x1,y1,x2,y2 = clamp(b[0],b[1],b[2],b[3],w,h)
+            if x2-x1>=MIN_FACE_PX and y2-y1>=MIN_FACE_PX:
+                boxes.append((x1,y1,x2,y2))
         return boxes
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RETINAFACE BACKGROUND THREAD
+# NMS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class RetinaThread:
-    def __init__(self):
-        from retinaface import RetinaFace as RF
-        self.RF = RF
-        self.lock = threading.Lock()
-        self.input_frame = None
-        self.result_boxes = []
-        self.new_input = False
-        self.on = True
-        self.ready = False
-        print("[INIT] RetinaFace loading...")
-        tmp = "/tmp/_rf_warm.jpg"
-        cv2.imwrite(tmp, np.zeros((100, 100, 3), dtype=np.uint8))
-        try:
-            self.RF.detect_faces(tmp)
-        except:
-            pass
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        print("[INIT] RetinaFace ✓ (background)")
-        self.ready = True
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def submit(self, frame):
-        with self.lock:
-            self.input_frame = frame.copy()
-            self.new_input = True
-
-    def get_results(self):
-        with self.lock:
-            return list(self.result_boxes)
-
-    def stop(self):
-        self.on = False
-
-    def _loop(self):
-        tmp = "/tmp/_rf_det.jpg"
-        while self.on:
-            frame = None
-            with self.lock:
-                if self.new_input:
-                    frame = self.input_frame
-                    self.new_input = False
-            if frame is None:
-                time.sleep(0.05)
-                continue
-            try:
-                cv2.imwrite(tmp, frame)
-                resp = self.RF.detect_faces(tmp)
-            except:
-                resp = {}
-            h, w = frame.shape[:2]
-            boxes = []
-            if isinstance(resp, dict):
-                for key in resp:
-                    face = resp[key]
-                    if face.get("score", 0) < RETINA_CONF:
-                        continue
-                    fa = face["facial_area"]
-                    x1, y1, x2, y2 = clamp(fa[0], fa[1], fa[2], fa[3], w, h)
-                    if x2 - x1 > 10 and y2 - y1 > 10:
-                        boxes.append((x1, y1, x2, y2))
-            with self.lock:
-                self.result_boxes = boxes
-
-    def detect_single(self, img):
-        tmp = "/tmp/_rf_aud.jpg"
-        cv2.imwrite(tmp, img)
-        try:
-            resp = self.RF.detect_faces(tmp)
-        except:
-            return []
-        h, w = img.shape[:2]
-        boxes = []
-        if isinstance(resp, dict):
-            for key in resp:
-                if resp[key].get("score", 0) >= 0.50:
-                    fa = resp[key]["facial_area"]
-                    x1, y1, x2, y2 = clamp(fa[0], fa[1], fa[2], fa[3], w, h)
-                    if x2 - x1 > 10 and y2 - y1 > 10:
-                        boxes.append((x1, y1, x2, y2))
-        return boxes
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# NMS FUSION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def fuse_boxes(box_lists):
-    pool = []
-    for bl in box_lists:
-        pool.extend(bl)
-    if not pool:
-        return []
-    # Sort by area descending
-    pool.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
-    kept = []
-    used = [False] * len(pool)
-    for i in range(len(pool)):
-        if used[i]:
-            continue
-        bx = list(pool[i])
-        cnt = 1
-        for j in range(i + 1, len(pool)):
-            if used[j]:
-                continue
-            if iou_single(pool[i], pool[j]) > 0.35:
+def nms(boxes, iou_thresh=0.35):
+    if len(boxes) <= 1: return boxes
+    boxes = sorted(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+    kept = []; used = [False]*len(boxes)
+    for i in range(len(boxes)):
+        if used[i]: continue
+        bx = list(boxes[i]); cnt = 1
+        for j in range(i+1, len(boxes)):
+            if used[j]: continue
+            if iou(boxes[i], boxes[j]) > iou_thresh:
                 used[j] = True
-                for k in range(4):
-                    bx[k] += pool[j][k]
+                for k in range(4): bx[k] += boxes[j][k]
                 cnt += 1
         used[i] = True
-        kept.append(tuple(v // cnt for v in bx))
+        kept.append(tuple(v//cnt for v in bx))
     return kept
 
 
@@ -626,173 +458,139 @@ def fuse_boxes(box_lists):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Auditor:
-    def __init__(self, detect_fn, data, lock):
-        self.detect = detect_fn
-        self.data = data
-        self.lock = lock
-        self.on = True
+    def __init__(self, face_det, data, lock):
+        self.det = face_det; self.data = data; self.lock = lock; self.on = True
         threading.Thread(target=self._loop, daemon=True).start()
-        print("[AUDIT] Started (every 30s)")
+        print(f"[AUDIT] Background auditor (every {AUDIT_INTERVAL}s)")
 
-    def stop(self):
-        self.on = False
+    def stop(self): self.on = False
 
     def _loop(self):
-        time.sleep(15)
+        time.sleep(AUDIT_INTERVAL)
         while self.on:
-            try:
-                self._run()
-            except Exception as e:
-                print(f"[AUDIT] err: {e}")
-            for _ in range(AUDIT_INTERVAL * 10):
-                if not self.on:
-                    return
+            try: self._run()
+            except Exception as e: print(f"[AUDIT] err: {e}")
+            for _ in range(AUDIT_INTERVAL*10):
+                if not self.on: return
                 time.sleep(0.1)
 
     def _run(self):
-        if not os.path.isdir(FACES_DIR):
-            return
+        if not os.path.isdir(FACES_DIR): return
         dirs = [d for d in os.listdir(FACES_DIR)
-                if os.path.isdir(os.path.join(FACES_DIR, d))
-                and d.startswith("Person_")]
-        if not dirs:
-            return
+                if os.path.isdir(os.path.join(FACES_DIR,d)) and d.startswith("Person_")]
+        if not dirs: return
         print(f"[AUDIT] Checking {len(dirs)} people...")
-
-        valid = {}
-        to_del = []
-
+        valid = {}; to_del = []
         for pn in dirs:
             pd = os.path.join(FACES_DIR, pn)
-            imgs = [f for f in os.listdir(pd)
-                    if f.lower().endswith((".jpg", ".png", ".jpeg"))]
-            if not imgs:
-                to_del.append(pn)
-                continue
-            real = 0
-            pdata = []
+            imgs = [f for f in os.listdir(pd) if f.lower().endswith((".jpg",".png",".jpeg"))]
+            if not imgs: to_del.append(pn); continue
+            real = 0; pdata = []
             for imf in imgs:
                 img = cv2.imread(os.path.join(pd, imf))
-                if img is None:
-                    continue
-                if self.detect(img):
-                    real += 1
-                    pdata.append((img, hist_of(img)))
-            if real == 0:
-                to_del.append(pn)
-            elif pdata:
-                valid[pn] = pdata
-
+                if img is None: continue
+                if self.det.detect(img): real += 1; pdata.append(hist_of(img))
+            if real == 0: to_del.append(pn)
+            elif pdata: valid[pn] = pdata
         for pn in to_del:
-            print(f"[AUDIT] Delete {pn} (no faces)")
-            shutil.rmtree(os.path.join(FACES_DIR, pn), ignore_errors=True)
-            with self.lock:
-                self.data.pop(pn, None)
-                save_data(DATA_FILE, self.data)
-
+            print(f"[AUDIT] Delete {pn}")
+            shutil.rmtree(os.path.join(FACES_DIR,pn), ignore_errors=True)
+            with self.lock: self.data.pop(pn,None); save_data(DATA_FILE,self.data)
+        # Merge duplicates
         names = sorted(valid.keys(), key=lambda n: int(n.split("_")[1]))
         merged = set()
         for i in range(len(names)):
-            if names[i] in merged:
-                continue
-            for j in range(i + 1, len(names)):
-                if names[j] in merged:
-                    continue
-                bc = max(
-                    cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
-                    for _, h1 in valid[names[i]]
-                    for _, h2 in valid[names[j]]
-                )
+            if names[i] in merged: continue
+            for j in range(i+1, len(names)):
+                if names[j] in merged: continue
+                bc = max(cv2.compareHist(h1,h2,cv2.HISTCMP_CORREL)
+                         for h1 in valid[names[i]] for h2 in valid[names[j]])
                 if bc >= AUDIT_HIST_CORREL:
                     victim, keeper = names[j], names[i]
-                    print(f"[AUDIT] Merge {victim}→{keeper} (sim={bc:.2f})")
+                    print(f"[AUDIT] Merge {victim}→{keeper}")
                     merged.add(victim)
-                    vd = os.path.join(FACES_DIR, victim)
-                    kd = os.path.join(FACES_DIR, keeper)
+                    vd,kd = os.path.join(FACES_DIR,victim), os.path.join(FACES_DIR,keeper)
                     if os.path.isdir(vd):
                         with self.lock:
-                            kc = self.data.get(keeper, {}).get("image_count", 0)
+                            kc = self.data.get(keeper,{}).get("image_count",0)
                             for f in os.listdir(vd):
-                                if f.lower().endswith((".jpg", ".png", ".jpeg")):
+                                if f.lower().endswith((".jpg",".png",".jpeg")):
                                     kc += 1
-                                    try:
-                                        shutil.move(
-                                            os.path.join(vd, f),
-                                            os.path.join(kd, f"{keeper}_{kc}.jpg"))
-                                    except:
-                                        pass
-                            if keeper in self.data:
-                                self.data[keeper]["image_count"] = kc
-                            self.data.pop(victim, None)
-                            save_data(DATA_FILE, self.data)
+                                    try: shutil.move(os.path.join(vd,f),
+                                                     os.path.join(kd,f"{keeper}_{kc}.jpg"))
+                                    except: pass
+                            if keeper in self.data: self.data[keeper]["image_count"]=kc
+                            self.data.pop(victim,None); save_data(DATA_FILE,self.data)
                         shutil.rmtree(vd, ignore_errors=True)
-
         nd, nm = len(to_del), len(merged)
-        if nd or nm:
-            print(f"[AUDIT] Done: deleted {nd}, merged {nm}")
-        else:
-            print("[AUDIT] All clean ✓")
+        if nd or nm: print(f"[AUDIT] Cleaned {nd} deleted, {nm} merged")
+        else: print("[AUDIT] All clean ✓")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SAVE / DRAW
+# SAVE / DRAW / NAME
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def save_photo(frame, trk, data, lock):
-    now = time.time()
-    if now - trk.last_save_time < SAVE_COOLDOWN:
-        return
-    box = trk.get_box()
-    x1, y1, x2, y2 = box
-    hf, wf = frame.shape[:2]
-    bw, bh = x2 - x1, y2 - y1
-    mx, my = int(bw * 0.3), int(bh * 0.3)
-    c = (max(0, x1 - mx), max(0, y1 - my), min(wf, x2 + mx), min(hf, y2 + my))
-    crop = frame[c[1]:c[3], c[0]:c[2]]
-    if crop.size == 0:
-        return
+def save_photo(frame, track, data, lock):
+    if track.saved_once: return
+    box = track.kf.get_box()
+    x1,y1,x2,y2 = box; hf,wf = frame.shape[:2]
+    bw,bh = x2-x1, y2-y1
+    mx,my = int(bw*0.3), int(bh*0.3)
+    c = (max(0,x1-mx),max(0,y1-my),min(wf,x2+mx),min(hf,y2+my))
+    crop = frame[c[1]:c[3],c[0]:c[2]]
+    if crop.size == 0: return
     with lock:
-        data[trk.name]["image_count"] = data[trk.name].get("image_count", 0) + 1
-        cnt = data[trk.name]["image_count"]
-        save_data(DATA_FILE, data)
-    fp = os.path.join(FACES_DIR, trk.name, f"{trk.name}_{cnt}.jpg")
+        data[track.name]["image_count"] = data[track.name].get("image_count",0)+1
+        cnt = data[track.name]["image_count"]; save_data(DATA_FILE,data)
+    fp = os.path.join(FACES_DIR, track.name, f"{track.name}_{cnt}.jpg")
     cv2.imwrite(fp, crop)
-    trk.last_save_time = now
+    track.saved_once = True; track.last_save = time.time()
     print(f"[SAVE] {fp}")
 
 
-def draw_frame(frame, tracks, n_det, fps, skip, backend):
+class NamePrompter:
+    def __init__(self, data, lock):
+        self.data=data; self.lock=lock; self.q=queue.Queue()
+        self.pending=set(); self.on=True
+        threading.Thread(target=self._loop, daemon=True).start()
+    def request(self, pk):
+        with self.lock: lbl = self.data.get(pk,{}).get("display_name",pk)
+        if lbl != pk or pk in self.pending: return
+        self.pending.add(pk); self.q.put(pk)
+    def stop(self): self.on=False; self.q.put(None)
+    def _loop(self):
+        while self.on:
+            pk = self.q.get()
+            if pk is None: return
+            try: txt = input(f"[NAME] Enter name for {pk} (blank=keep): ").strip()
+            except EOFError: return
+            finally: self.pending.discard(pk)
+            if not txt: continue
+            with self.lock:
+                if pk in self.data: self.data[pk]["display_name"]=txt; save_data(DATA_FILE,self.data)
+            print(f"[NAME] {pk} → {txt}")
+
+
+def draw(frame, tracks, face_boxes, fps, skip, n_cand):
     h, w = frame.shape[:2]
-
-    for trk, _ in tracks:
-        x1, y1, x2, y2 = trk.get_box()
-        # Clamp to frame
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-
-        # Green box with slight transparency effect via thickness
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 230, 0), 2, cv2.LINE_AA)
-
-        # Label background
-        lbl = trk.name
+    for t in tracks:
+        x1,y1,x2,y2 = t.kf.get_box()
+        x1,y1 = max(0,x1),max(0,y1); x2,y2 = min(w,x2),min(h,y2)
+        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,230,0),2,cv2.LINE_AA)
+        lbl = t.display_name
         font = cv2.FONT_HERSHEY_SIMPLEX
-        (tw, th), baseline = cv2.getTextSize(lbl, font, 0.55, 1)
-        cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1),
-                      (0, 200, 0), -1, cv2.LINE_AA)
-        cv2.putText(frame, lbl, (x1 + 3, y1 - 5),
-                    font, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
-
-    # HUD
-    hud = f"Faces:{n_det}  FPS:{fps:.0f}  Skip:{skip}  [{backend}]"
-    cv2.putText(frame, hud, (8, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(frame, hud, (8, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-
-    # Center deadzone
-    cx, cy = w // 2, h // 2
-    cv2.rectangle(frame, (cx - DEADZONE, cy - DEADZONE),
-                  (cx + DEADZONE, cy + DEADZONE), (0, 0, 200), 1, cv2.LINE_AA)
+        (tw,th),_ = cv2.getTextSize(lbl,font,0.55,1)
+        cv2.rectangle(frame,(x1,y1-th-10),(x1+tw+6,y1),(0,200,0),-1,cv2.LINE_AA)
+        cv2.putText(frame,lbl,(x1+3,y1-5),font,0.55,(0,0,0),1,cv2.LINE_AA)
+    for x1,y1,x2,y2 in face_boxes:
+        cv2.rectangle(frame,(x1,y1),(x2,y2),(255,180,0),1,cv2.LINE_AA)
+    hud = (f"Confirmed:{len(tracks)}  Candidates:{n_cand}  "
+           f"Faces:{len(face_boxes)}  FPS:{fps:.0f}  Skip:{skip}")
+    cv2.putText(frame,hud,(8,22),cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,0,0),3,cv2.LINE_AA)
+    cv2.putText(frame,hud,(8,22),cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,255),1,cv2.LINE_AA)
+    cx,cy = w//2,h//2
+    cv2.rectangle(frame,(cx-DEADZONE,cy-DEADZONE),(cx+DEADZONE,cy+DEADZONE),(0,0,200),1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -803,172 +601,76 @@ def main():
     data = load_data(DATA_FILE)
     lock = threading.Lock()
     os.makedirs(FACES_DIR, exist_ok=True)
-    os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # Download models
-    pp = os.path.join(MODEL_DIR, "deploy.prototxt")
-    cm = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
-    yp = os.path.join(MODEL_DIR, "face_detection_yunet_2023mar.onnx")
-    dl(PROTOTXT_URL, pp)
-    dl(CAFFE_URL, cm)
-    dl(YUNET_URL, yp)
+    face_det = FaceDetector()
+    tracker = Tracker(data)
+    auditor = Auditor(face_det, data, lock)
+    prompter = NamePrompter(data, lock) if sys.stdin.isatty() else None
 
-    # Fast detectors
-    fast = []
-    names = []
-    try:
-        fast.append(SSD(pp, cm))
-        names.append("SSD")
-    except Exception as e:
-        print(f"[WARN] SSD: {e}")
-    if hasattr(cv2, "FaceDetectorYN"):
-        try:
-            fast.append(YuNetDet(yp))
-            names.append("YuNet")
-        except Exception as e:
-            print(f"[WARN] YuNet: {e}")
-    if not fast:
-        cp = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        if os.path.exists(cp):
-            cas = cv2.CascadeClassifier(cp)
-
-            class HW:
-                def detect(self, f):
-                    g = cv2.equalizeHist(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
-                    h_, w_ = f.shape[:2]
-                    return [(x, y, x + bw, y + bh)
-                            for x, y, bw, bh in
-                            cas.detectMultiScale(g, 1.1, 5, 0, (60, 60))]
-
-            fast.append(HW())
-            names.append("Haar")
-        else:
-            print("ERROR: No detector")
-            sys.exit(1)
-
-    # Optional RetinaFace
-    retina = None
-    try:
-        retina = RetinaThread()
-        names.append("RetinaFace(bg)")
-    except ImportError:
-        print("[INFO] retina-face not installed — SSD+YuNet only")
-        print("       For best accuracy: pip install retina-face")
-    except Exception as e:
-        print(f"[INFO] RetinaFace unavailable: {e}")
-
-    backend = " + ".join(names)
-    print(f"\n[INIT] Detectors: {backend}")
-
-    def audit_detect(img):
-        if retina and retina.ready:
-            return retina.detect_single(img)
-        return fast[0].detect(img) if fast else []
-
-    # Camera
-    try:
-        cam = Cam(CAMERA_INDEX)
-    except RuntimeError as e:
-        print(f"ERROR: {e}")
-        sys.exit(1)
+    try: cam = Cam(CAMERA_INDEX)
+    except RuntimeError as e: print(f"ERROR: {e}"); sys.exit(1)
     _, test = cam.read()
-    if test is None:
-        print("ERROR: No frame")
-        sys.exit(1)
+    if test is None: print("ERROR: No frame"); sys.exit(1)
     oh, ow = test.shape[:2]
-    sc = DETECT_WIDTH / ow
-    dw, dh = DETECT_WIDTH, int(oh * sc)
-    sx, sy = ow / dw, oh / dh
-    print(f"Camera {CAMERA_INDEX}: {ow}x{oh} → detect at {dw}x{dh}")
+    print(f"Camera {CAMERA_INDEX}: {ow}x{oh}")
     print(f"Press 'q' to quit.\n")
 
-    # Tracker + auditor
-    tracker = SORTTracker(data)
-    auditor = Auditor(audit_detect, data, lock)
-
-    skip = 2
-    fc = 0
-    fpsd = deque(maxlen=60)
-    n_det = 0
-    display_tracks = []
-    retina_counter = 0
-    retina_interval = 6
+    skip = 2; fc = 0; fpsd = deque(maxlen=60)
+    face_boxes = []; display_tracks = []
 
     try:
         while True:
             t0 = time.time()
             ret, frame = cam.read()
-            if not ret or frame is None:
-                time.sleep(0.001)
-                continue
+            if not ret or frame is None: time.sleep(0.001); continue
             fc += 1
             do_det = (fc % skip == 0)
 
-            # EVERY frame: Kalman predict (keeps boxes moving smoothly)
+            # Predict every frame (keeps boxes smooth between detections)
             tracker.predict()
 
             if do_det:
                 td0 = time.time()
 
-                small = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_LINEAR)
+                # Face detection on full-res frame
+                raw_faces = face_det.detect(frame)
+                face_boxes = nms(raw_faces)
 
-                all_boxes = []
-                for det in fast:
-                    try:
-                        all_boxes.append(scale_boxes(det.detect(small), sx, sy))
-                    except:
-                        all_boxes.append([])
+                # Update tracker with face detections ONLY
+                tracker.update(face_boxes)
 
-                # Merge RetinaFace results
-                if retina:
-                    rb = retina.get_results()
-                    if rb:
-                        all_boxes.append(rb)
-                    retina_counter += 1
-                    if retina_counter >= retina_interval:
-                        retina_counter = 0
-                        retina.submit(frame)
+                # Auto-tune skip for framerate
+                det_ms = (time.time()-td0)*1000
+                budget = 1000.0/TARGET_FPS
+                if det_ms > budget*0.5: skip = min(skip+1, MAX_SKIP)
+                elif det_ms < budget*0.2 and skip > MIN_SKIP: skip -= 1
 
-                fused = fuse_boxes(all_boxes)
-                n_det = len(fused)
-                display_tracks = tracker.update(fused)
+                # Save photo + prompt name for newly graduated tracks
+                for pt in tracker.just_graduated:
+                    save_photo(frame, pt, data, lock)
+                    if prompter: prompter.request(pt.name)
 
-                # Adapt skip
-                det_ms = (time.time() - td0) * 1000
-                budget = 1000.0 / TARGET_FPS
-                if det_ms > budget * 0.5:
-                    skip = min(skip + 1, MAX_SKIP)
-                elif det_ms < budget * 0.2 and skip > MIN_SKIP:
-                    skip -= 1
+            # Refresh display names
+            display_tracks = tracker.get_display()
+            with lock:
+                for t in display_tracks:
+                    t.display_name = data.get(t.name,{}).get("display_name",t.name)
 
-                # Save photos
-                for trk, new in display_tracks:
-                    if new:
-                        save_photo(frame, trk, data, lock)
-            else:
-                # Between detections: show Kalman-predicted positions
-                display_tracks = tracker.get_display_tracks()
-
-            # FPS
-            el = time.time() - t0
+            el = time.time()-t0
             fpsd.append(el)
-            fps = len(fpsd) / max(sum(fpsd), 0.001)
+            fps = len(fpsd)/max(sum(fpsd),0.001)
 
-            draw_frame(frame, display_tracks, n_det, fps, skip, backend)
+            draw(frame, display_tracks, face_boxes, fps, skip, len(tracker.candidates))
             cv2.imshow("Face Tracker", frame)
 
-            wait = max(1, int(1000.0 / TARGET_FPS - el * 1000))
-            if cv2.waitKey(wait) & 0xFF == ord("q"):
-                break
+            wait = max(1, int(1000.0/TARGET_FPS - el*1000))
+            if cv2.waitKey(wait) & 0xFF == ord("q"): break
 
     finally:
-        if retina:
-            retina.stop()
         auditor.stop()
-        with lock:
-            save_data(DATA_FILE, data)
-        cam.release()
-        cv2.destroyAllWindows()
+        if prompter: prompter.stop()
+        with lock: save_data(DATA_FILE, data)
+        cam.release(); cv2.destroyAllWindows()
         print("Exited cleanly.")
 
 
